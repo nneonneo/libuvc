@@ -396,6 +396,27 @@ uvc_error_t uvc_probe_stream_ctrl(
 }
 
 /** @internal
+ * @brief Delete a transfer from the stream.
+ *
+ * Call with strmh->cb_mutex locked.
+ */
+static void _uvc_remove_transfer_locked(uvc_stream_handle_t *strmh, struct libusb_transfer *transfer) {
+  int i;
+  for(i=0; i<ARRAYSIZE(strmh->transfers); i++) {
+    if(strmh->transfers[i] == transfer) {
+      UVC_DEBUG("Freeing transfer %d (%p)", i, transfer);
+      free(transfer->buffer);
+      libusb_free_transfer(transfer);
+      strmh->transfers[i] = NULL;
+      break;
+    }
+  }
+  if(i == ARRAYSIZE(strmh->transfers)) {
+    UVC_DEBUG("transfer %p not found; not freeing!", transfer);
+  }
+}
+
+/** @internal
  * @brief Isochronous transfer callback
  * 
  * Processes stream, places frames into buffer, signals listeners
@@ -505,23 +526,11 @@ void _uvc_iso_callback(struct libusb_transfer *transfer) {
   case LIBUSB_TRANSFER_CANCELLED: 
   case LIBUSB_TRANSFER_ERROR:
   case LIBUSB_TRANSFER_NO_DEVICE: {
-    int i;
     UVC_DEBUG("not retrying transfer, status = %d", transfer->status);
     pthread_mutex_lock(&strmh->cb_mutex);
 
     /* Mark transfer as deleted. */
-    for(i=0; i<ARRAYSIZE(strmh->transfers); i++) {
-      if(strmh->transfers[i] == transfer) {
-        UVC_DEBUG("Freeing transfer %d (%p)", i, transfer);
-        free(transfer->buffer);
-        libusb_free_transfer(transfer);
-        strmh->transfers[i] = NULL;
-        break;
-      }
-    }
-    if(i == ARRAYSIZE(strmh->transfers)) {
-      UVC_DEBUG("transfer %p not found; not freeing!", transfer);
-    }
+    _uvc_remove_transfer_locked(strmh, transfer);
 
     pthread_cond_broadcast(&strmh->cb_cond);
     pthread_mutex_unlock(&strmh->cb_mutex);
@@ -534,9 +543,17 @@ void _uvc_iso_callback(struct libusb_transfer *transfer) {
     UVC_DEBUG("retrying transfer, status = %d", transfer->status);
     break;
   }
-  
-  if (strmh->running)
+
+  if (strmh->running) {
     libusb_submit_transfer(transfer);
+  } else {
+    pthread_mutex_lock(&strmh->cb_mutex);
+    /* Mark transfer as deleted. */
+    _uvc_remove_transfer_locked(strmh, transfer);
+
+    pthread_cond_broadcast(&strmh->cb_cond);
+    pthread_mutex_unlock(&strmh->cb_mutex);
+  }
 }
 
 /** Begin streaming video from the camera into the callback function.
